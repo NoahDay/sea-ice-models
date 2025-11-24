@@ -98,6 +98,7 @@ used for the break points on panel (b) and fracture histogram in (c).
 from sys import argv
 import numpy as np
 import time
+from scipy.linalg import solve  # for DGESV equivalent
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.widgets import Button, Slider
@@ -169,6 +170,7 @@ fph_button_text = r"$\phi(f)=\pi$"
 rph_button_text = r"$\phi(f)\sim\mathrm{U}(0,2\pi)$"
 res_button_text = r"$\mathbf{Reset}$"
 mon_button_text = u"\u00bd" + r"$H_\mathrm{s}\cos\left(k_\mathrm{p}x+\phi_\mathrm{p}\right)$"
+alt_button_text = r"$\mathbf{Alternative}$"
 
 # --------------------------------------------------------------------------- #
 # Functions for calculations
@@ -256,7 +258,7 @@ def calc_break_locs(x1d_in, ssh_in, dx_in, rmin_in, hi_in, ec_in):
     integer number of dx), so there may be some minor round-off error.
     """
 
-    nx = len(x1d_in)
+    nx = len(x1d_in) #slider_nx.val
 
     # Locate the extrema in SSH; create boolean arrays to track whether each point
     # along x1d_in corresponds to an minima or to a maxima:
@@ -327,6 +329,216 @@ def calc_break_locs(x1d_in, ssh_in, dx_in, rmin_in, hi_in, ec_in):
 
     return breaks_out
 
+def calc_break_locs_alt(x1d_in, ssh_in, dx_in, hi_in, floe_rad_c, straincrit=ec_0):
+    """
+    Alternative solver: compute both fracture histogram and break locations.
+    
+    Arguments:
+        x1d_in     : 1D spatial domain (m)
+        ssh_in     : sea surface height (m)
+        dx_in      : domain spacing (m)
+        hi_in      : mean ice thickness (m)
+        floe_rad_c : floe size bin centers (m)
+        straincrit : critical strain threshold (default 3e-5)
+    
+    Returns:
+        frac_hist  : binned fracture histogram (normalized)
+        break_locs : array of indices where ice breaks
+    """
+    nx = len(x1d_in)
+    break_locs = []
+
+    # First, collect all candidate break points
+    for L in floe_rad_c:
+        strain = compute_strain_elastic_plate(x1d_in, ssh_in, L, hi_in)
+        exceed = np.where(strain > straincrit)[0]
+        break_locs.extend(exceed.tolist())
+
+    # Remove duplicates and sort
+    break_locs = np.unique(break_locs)
+
+    # Calculate fracture radii from break locations
+    if len(break_locs) > 1:
+        frac_radii = 0.5 * np.diff(x1d_in[break_locs])
+        # Bin into histogram
+        frac_hist = np.zeros_like(floe_rad_c)
+        for r in frac_radii:
+            idx = np.argmin(np.abs(floe_rad_c - r))
+            frac_hist[idx] += 1
+        if np.sum(frac_hist) > 0:
+            frac_hist /= np.sum(frac_hist)
+    else:
+        frac_hist = np.zeros_like(floe_rad_c)
+
+    return frac_hist, break_locs
+
+
+
+def solve_yt_for_strain(nfsd, nfreq, floe_rad_c,
+                        wavefreq, dwavefreq, floesize, hbar, spec_efreq, 
+                        data_phase, nx_in,
+                        # x_in,  dx_in,
+                        straincrit=ec_0, young_mod=5e9, rhoi=922, rhow=1025, gravit=grav):
+    """
+    Compute strain along a floe using the 'solve_yt_for_strain' approach.
+    Returns both the normalized fracture histogram and the break point indices.
+    
+    Parameters
+    ----------
+    nfsd : int
+        Number of floe size bins.
+    nfreq : int
+        Number of wave frequencies.
+    floe_rad_l : array
+        Floe radius lower bin edges (m)
+    floe_rad_c : array
+        Floe radius bin centers (m)
+    wavefreq : array
+        Wave frequencies (Hz)
+    dwavefreq : array
+        Wave frequency bin widths (Hz)
+    floesize : float
+        Floe length (m)
+    hbar : float
+        Floe thickness (m)
+    spec_efreq : array
+        Wave spectrum (m^2 s)
+    straincrit : float
+        Critical strain threshold
+    dx : float
+        Spatial step (m)
+    young_mod : float
+        Young's modulus of ice (Pa)
+    rhoi : float
+        Ice density (kg/m^3)
+    rhow : float
+        Water density (kg/m^3)
+    gravit : float
+        Gravity (m/s^2)
+    
+    Returns
+    -------
+    frac_local : array
+        Normalized fracture histogram
+    break_locs : array
+        Indices of x where ice breaks
+    """
+
+    # Characteristic length scale
+    I = hbar**3 / 12.0
+    Lambda = (young_mod * I / (rhow * gravit))**0.25
+    c2 = 2.0  # dimensionless coefficient from Fortran (can adjust)
+    c1 = 1.0
+    c0 = 0.0
+
+    # Spatial domain
+    # nx = nx_in
+    floesize_int = int(np.round(floesize))
+    dx = 0.5 # m
+    nx = int(np.round(floesize_int/dx+dx))  
+    x = np.linspace(-floesize_int/c2, floesize_int/c2, nx)
+
+    
+    # dx = floesize / (nx - 1)       # spatial step based on floe length
+    # x = np.linspace(0, floesize, nx)  # coordinates from 0 to floe length
+
+    # x = x_in
+    # dx = dx_in
+    # nx = nx_in
+    # Dispersion relation
+    lamdai = gravit / (2*np.pi*wavefreq**2)
+    
+    # Spectral coefficients
+    spec_coeff = np.sqrt(c2 * spec_efreq * dwavefreq)
+
+    # Random phases
+    PHIi = data_phase
+
+    # Scaling
+    gamm = floesize / (c2 * np.sqrt(c2) * Lambda)
+    langi = lamdai / (c2 * np.pi)
+    AAmi = spec_coeff * langi**4 / (Lambda**4 + langi**4)
+    xp = x / (np.sqrt(c2) * Lambda)
+
+    # Floating line coefficients (simplified)
+    m = 6.0/(floesize**2) * np.sum(spec_coeff * lamdai/np.pi * np.sin(PHIi) *
+                            (-np.cos(np.pi*floesize/lamdai) + lamdai/(np.pi*floesize)*np.sin(np.pi*floesize/lamdai)))
+            # ssh_out[:] += np.sqrt(2. * wspec_in[i] * wdfreq_in[i]) \
+                    #   * np.cos(fphase_in[i] + 4. * np.pi**2 * wfreq_in[i]**2 * x1d_in[:] / grav)
+    b = (c1/floesize) * np.sum(spec_coeff * lamdai/np.pi * np.sin(np.pi*floesize/lamdai) * np.cos(PHIi)) - rhoi/rhow*hbar
+    bp = -b - rhoi/rhow*hbar
+    ap = -m
+
+    # Homogeneous solution for L <= 300
+    strain = np.zeros(nx)
+    if floesize <= 300:
+        aa = np.zeros((4,4))
+        aa[0,0] = np.exp(-gamm) * np.sin(gamm)
+        aa[0,1] = np.exp(-gamm) * np.cos(gamm)
+        aa[0,2] = -np.exp(gamm) * np.sin(gamm)
+        aa[0,3] = -np.exp(gamm) * np.cos(gamm)
+
+        aa[1,0] = -np.exp(gamm) * np.sin(gamm)
+        aa[1,1] = np.exp(gamm) * np.cos(gamm)
+        aa[1,2] = np.exp(-gamm) * np.sin(gamm)
+        aa[1,3] = -np.exp(-gamm) * np.cos(gamm)
+
+        aa[2,0] = np.sin(gamm) * np.cosh(gamm) + np.cos(gamm) * np.sinh(gamm)
+        aa[2,1] = -np.cos(gamm) * np.sinh(gamm) + np.sin(gamm) * np.cosh(gamm)
+        aa[2,2] = np.sin(gamm) * np.cosh(gamm) + np.cos(gamm) * np.sinh(gamm)
+        aa[2,3] = -np.sin(gamm) * np.cosh(gamm) + np.cos(gamm) * np.sinh(gamm)
+
+        aa[3,0] = gamm * np.sin(gamm) * np.sinh(gamm) + gamm * np.cos(gamm) * np.cosh(gamm) - np.sin(gamm) * np.cosh(gamm)
+        aa[3,1] = gamm * np.sin(gamm) * np.sinh(gamm) - gamm * np.cos(gamm) * np.cosh(gamm) + np.cos(gamm) * np.sinh(gamm)
+        aa[3,2] = -gamm * np.cos(gamm) * np.cosh(gamm) - gamm * np.sin(gamm) * np.sinh(gamm) + np.sin(gamm) * np.cosh(gamm)
+        aa[3,3] = -gamm * np.cos(gamm) * np.cosh(gamm) + gamm * np.sin(gamm) * np.sinh(gamm) + np.cos(gamm) * np.sinh(gamm)
+
+
+        # (Other rows filled similarly...)
+        # Right-hand side
+        bb = np.zeros(4)
+        bb[0] = Lambda**2 * np.sum(AAmi/ (langi**2) * np.cos(floesize/(c2*langi)+PHIi))
+        bb[1] = Lambda**2 * np.sum(AAmi/ (langi**2) * np.cos(floesize/(c2*langi)-PHIi))
+        bb[2] = -np.sqrt(c2)/(c2*Lambda)*(np.sum(AAmi*langi*(np.sin(floesize/(c2*langi)-PHIi) + np.sin(floesize/(c2*langi)+PHIi))) + bp*floesize)
+        bb[3] = -c1/(c2*Lambda**2)*(np.sum(AAmi*langi*(floesize/c2*(np.sin(floesize/(c2*langi)-PHIi)-np.sin(floesize/(c2*langi)+PHIi)) + langi*(np.cos(floesize/(c2*langi)-PHIi)-np.cos(floesize/(c2*langi)+PHIi)))) + ap*floesize**3/12)
+        cc = solve(aa, bb)  # Solve 4x4 system
+
+        # Homogeneous solution
+        yH = np.exp(xp)*(cc[0]*np.cos(xp)+cc[1]*np.sin(xp)) + \
+             np.exp(-xp)*(cc[2]*np.cos(xp)+cc[3]*np.sin(xp))
+        yppH = (np.exp(xp)*(-cc[0]*np.sin(xp)+cc[1]*np.cos(xp)) - \
+                np.exp(-xp)*(-cc[2]*np.sin(xp)+cc[3]*np.cos(xp))) / Lambda**2
+
+    # Particular solution
+    arg = np.zeros((nfreq,nx))
+    for j in range(nx):
+        arg[:,j] = x[j]/langi - PHIi
+    yP = AAmi @ np.cos(arg) + (ap*x + bp)
+    yppP = - (AAmi/ langi**2) @ np.cos(arg)
+    strain_yP = hbar * yppP / c2
+
+    # Combine solutions
+    # only consider particular solution for floes>300m
+    if floesize > 300:
+        strain = strain_yP
+    else:
+        strain = hbar * (yppH + yppP) / c2
+
+    # Identify break points
+    break_locs = np.where(np.abs(strain) > straincrit)[0]
+
+    # Compute fracture histogram
+    frac_local = np.zeros(nfsd)
+    if len(break_locs) > 1:
+        frac_radii = 0.5 * np.diff(x[break_locs])
+        for r in frac_radii:
+            idx = np.argmin(np.abs(floe_rad_c - r))
+            frac_local[idx] += 1
+        if np.sum(frac_local) > 0:
+            frac_local /= np.sum(frac_local)
+
+    return frac_local, break_locs
+
 
 def calc_frac_radii(x1d_in, breaks_in):
     """Calculate an array of fracture lengths (as radii of resulting floes) from
@@ -334,6 +546,39 @@ def calc_frac_radii(x1d_in, breaks_in):
     which locations break (breaks_in) as calculated in function calc_break_locs().
     """
     return .5*(x1d_in[breaks_in][1:] - x1d_in[breaks_in][:-1])
+
+def alt_get_fraclengths(x, strain, floe_rad_c, straincrit = ec_0):
+    """
+    Given a 1D strain field, find fracture lengths (as radii) and bin into floe size categories.
+    
+    Args:
+        x           : 1D spatial array (m)
+        strain      : strain along the floe (same length as x)
+        floe_rad_c  : floe size bin centers (m)
+    
+    Returns:
+        frac_local  : binned histogram of fracture radii (normalized)
+    """
+    # Identify where strain exceeds critical threshold
+    exceed = np.where(strain > straincrit)[0]
+
+    if len(exceed) < 2:
+        return np.zeros_like(floe_rad_c)
+
+    # Fracture lengths (distance between successive points exceeding straincrit)
+    frac_lengths = np.diff(x[exceed]) / 2.0  # convert to radii
+
+    # Bin into floe size categories
+    frac_local = np.zeros_like(floe_rad_c)
+    for r in frac_lengths:
+        idx = np.argmin(np.abs(floe_rad_c - r))
+        frac_local[idx] += 1
+
+    # Normalize
+    if np.sum(frac_local) > 0:
+        frac_local /= np.sum(frac_local)
+
+    return frac_local
 
 
 def calc_frac_histogram(frac_radii_in):
@@ -588,11 +833,24 @@ if __name__ == "__main__":
     ax_rph = fig.add_axes([box_xy0[0] + bx1*box_wid, box_xy0[1] + by0*box_hei, bw1*box_wid, bh0*box_hei])
     ax_res = fig.add_axes([box_xy0[0] + bx0*box_wid, box_xy0[1] + by1*box_hei, bw0*box_wid, bh0*box_hei])
     ax_mon = fig.add_axes([box_xy0[0] + bx1*box_wid, box_xy0[1] + by1*box_hei, bw1*box_wid, bh0*box_hei])
+    # Position for alt solver button in a new row beneath the 2x2 grid
+    bx_alt = bx0              # align with first column
+    by_alt = by1 - 0.18       # slightly below the second row of buttons
+    bw_alt = bw1              # same width as second column buttons (or bw0)
+    bh_alt = bh0              # same height
+
+    ax_alt_solver = fig.add_axes([
+        box_xy0[0] + bx_alt*box_wid,
+        box_xy0[1] + by_alt*box_hei,
+        bw_alt*box_wid,
+        bh_alt*box_hei
+    ])
 
     ax_fph.set_label("<Button widget: fixed phase>")
     ax_rph.set_label("<Button widget: random phase>")
     ax_res.set_label("<Button widget: reset>")
     ax_mon.set_label("<Button widget: mono wave field>")
+    ax_mon.set_label("<Button widget: Alternate solver>")
 
     # Keyword arguments passed to all buttons and colors for showing whether the random
     # or fixed phase button is active or inactive:
@@ -605,6 +863,29 @@ if __name__ == "__main__":
     button_res = Button(ax_res, res_button_text, color=button_inactive_color, **button_kw)
     button_mon = Button(ax_mon, mon_button_text, color=button_inactive_color, **button_kw)
 
+
+    # Checkbox to toggle solver
+    use_alt_solver = False
+
+    def toggle_solver(event):
+        global use_alt_solver
+        use_alt_solver = not use_alt_solver
+        # update button color and label
+        if use_alt_solver:
+            button_solver.label.set_text("Alternative")
+            button_solver.color = button_active_color
+        else:
+            button_solver.label.set_text("HT15")
+            button_solver.color = button_inactive_color
+
+        update_fracture(event)
+        fig.canvas.draw_idle()
+
+    # Create an axes for the button (position: [left, bottom, width, height])
+    
+    # Create the button in the pre-defined axes
+    button_solver = Button(ax_alt_solver, "HT15", color=button_inactive_color, **button_kw)
+    button_solver.on_clicked(toggle_solver)
 
     # ----------------------------------------------------------------------- #
     # Create 'action' functions to be called when sliders are adjusted or
@@ -721,6 +1002,7 @@ if __name__ == "__main__":
         iter_count = 0
         fracerror = 1e12
         start_time = time.time()  # record start time of iterations
+        
         while iter_count < loop_max and fracerror > errortol:
             iter_count += 1
 
@@ -729,50 +1011,70 @@ if __name__ == "__main__":
                 data_phase = 2. * np.pi * np.random.random(len(data_phase))
 
             # Recompute SSH
-            if not data_is_mono:
+            if data_is_mono:
+                data_ssh = ssh_mono(data_x1d, slider_hs.val, slider_fp.val, data_phase[0])
+            else:
                 data_ssh = ssh(data_x1d, data_wfreq, data_wdfreq, data_wspec, data_phase)
 
-            # Calculate breaks and radii
-            data_breaks = calc_break_locs(data_x1d, data_ssh, rmin_in=slider_rmin.val,
-                                        dx_in=slider_dx.val, hi_in=slider_hi.val,
-                                        ec_in=slider_ec.val * ec_0)
-            data_frac_radii = calc_frac_radii(data_x1d, data_breaks)
+            if use_alt_solver:
+                # HT15 alternative replaced by solve_yt_for_strain
+                data_frac_hist[:] = 0
+                all_break_locs = []
 
-            # Bin into histogram
-            frachistogram[:] = 0
-            for r in data_frac_radii:
-                if r > BinLeft[0]:
-                    for k in range(nfsd-1):
-                        if BinLeft[k] <= r < BinRight[k]:
-                            frachistogram[k] += 1
-                    if r > BinRight[-1]:
-                        frachistogram[-1] += 1
-            frac_local = floe_rad_c * frachistogram
-            if np.sum(frac_local) > 0:
-                frac_local /= np.sum(frac_local)
+                hbar = slider_hi.val
+                nfsd = len(floe_rad_c)
+                nfreq = len(data_wfreq)
 
-            data_frac_hist[:] = frac_local.copy()
+                for floesize in floe_rad_c[1:]:  # Skip smallest bin (cannot fracture)
+                    # print(floesize)
+                    # tmp_data_x1d = np.linspace(floesize, slider_nx.val)
+                    frac_local, break_locs = solve_yt_for_strain(
+                        nfsd=len(floe_rad_c), nfreq=len(data_wfreq), floe_rad_c=floe_rad_c,
+                        wavefreq=data_wfreq, dwavefreq=data_wdfreq, 
+                        floesize=floesize, hbar=slider_hi.val, 
+                        spec_efreq=data_wspec, straincrit=slider_ec.val * ec_0,
+                        data_phase=data_phase[:len(data_wfreq)],  # ensure correct length,
+                        # x_in=tmp_data_x1d, #data_x1d, should be floe length not full domain
+                        nx_in=slider_nx.val,
+                    )
+                    
+                    data_frac_hist += frac_local
+                    all_break_locs.extend(break_locs)
 
-            data_frac_radii = calc_frac_radii    (data_x1d, data_breaks)
-            data_frac_hist  = calc_frac_histogram(data_frac_radii)
+                data_frac_hist /= np.sum(data_frac_hist) if np.sum(data_frac_hist) > 0 else 1
+                data_breaks = np.unique(all_break_locs)
 
-            # Convergence check
-            if phase_random:
-                fracerror = np.sum(np.abs(frac_local - prev_frac_local)) / nfsd
-                prev_frac_local = frac_local.copy()
+                data_frac_radii = calc_frac_radii(data_x1d, data_breaks)
+                data_frac_hist = calc_frac_histogram(data_frac_radii)
+                # Update scatter plot of break points
+                sctr_break.set_offsets(np.array([data_x1d_km[data_breaks], data_ssh[data_breaks]]).T)
+            else:
+                # Default HT15 solver
+                data_breaks = calc_break_locs(data_x1d, data_ssh, rmin_in=slider_rmin.val,
+                                            dx_in=slider_dx.val, hi_in=slider_hi.val,
+                                            ec_in=slider_ec.val * ec_0)
+                data_frac_radii = calc_frac_radii(data_x1d, data_breaks)
+                data_frac_hist = calc_frac_histogram(data_frac_radii)
+                # Update scatter plot of break points
+                sctr_break.set_offsets(np.array([data_x1d_km[data_breaks], data_ssh[data_breaks]]).T)
+
+            # Convergence check (for random phases)
+            if phase_random and len(data_frac_hist) == len(prev_frac_local):
+                fracerror = np.sum(np.abs(data_frac_hist - prev_frac_local)) / nfsd
+                prev_frac_local = data_frac_hist.copy()
             else:
                 fracerror = 0
 
-        elapsed_time = time.time() - start_time  # calculate elapsed time in seconds
+        elapsed_time = time.time() - start_time
 
-        # Update plot
-        line_ssh.set_data(data_x1d_km, data_ssh) 
-        sctr_break.set_offsets(np.array([data_x1d_km[data_breaks], data_ssh[data_breaks]]).T)
+        # Update bar plot
         [bar.set_height(data_frac_hist[i]) for i, bar in enumerate(bar_frac)]
         hist_stat_text.set_text(
-           stat_str(data_frac_radii) + f"\nIterations: {iter_count}\nTime: {elapsed_time:.3f} s"
+            stat_str(data_frac_radii) + f"\nIterations: {iter_count}\nTime: {elapsed_time:.3f} s"
         )
 
+        # Update SSH line
+        line_ssh.set_data(data_x1d_km, data_ssh)
         fig.canvas.draw_idle()
 
 
@@ -788,6 +1090,23 @@ if __name__ == "__main__":
         button_fph.color = button_active_color
         button_rph.color = button_inactive_color
         update_spectrum(event, phase_reset=True)
+
+    def toggle_solver(event):
+        """Toggle between HT15 (default) and Alternative solver."""
+        global use_alt_solver
+        use_alt_solver = not use_alt_solver
+        
+        # Update button color and label to indicate the current solver
+        if use_alt_solver:
+            button_solver.label.set_text("Alternative")
+            button_solver.color = button_active_color
+        else:
+            button_solver.label.set_text("HT15")
+            button_solver.color = button_inactive_color
+        
+        # Force recalculation of fracture
+        update_fracture(event)
+        fig.canvas.draw_idle()
 
 
     def toggle_mono_wave_field(event):
